@@ -1,12 +1,16 @@
-﻿using Domain.Entities;
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using Domain.Entities;
 using Domain.Interfaces;
 using Enums;
 using Models;
-using System.Text;
-using System.Text.RegularExpressions;
 using Utilities;
 
-namespace Infrastructure
+namespace MergeVideo.Infrastructure
 {
     public class FileRenamer : IFileRenamer
     {
@@ -27,24 +31,16 @@ namespace Infrastructure
 
         public IEnumerable<VideoFile> RenameAll(string parentFolder)
         {
-            // Check for existing renamed
             bool existing = Directory.EnumerateFiles(_work.VideosDir)
                 .Any(f => Regex.IsMatch(Path.GetFileName(f), @"^\d+\..+"));
             if (existing)
             {
-                Console.WriteLine("  - Existing renamed videos detected, skipping rename stage.");
-                return new List<VideoFile>();
+                return Directory.EnumerateFiles(_work.VideosDir)
+                    .OrderBy(x => x, new NumericNameComparer())
+                    .Select((p, i) => new VideoFile(i + 1, Path.GetFileName(p), Path.GetFileName(p), p))
+                    .ToList();
             }
 
-            // Count videos
-            int totalVideos = 0;
-            foreach (var sub in Utils.GetSubDirsSorted(parentFolder))
-                foreach (var f in Directory.EnumerateFiles(sub, "*"))
-                    if (Utils.IsVideo(f)) totalVideos++;
-            int padWidth = totalVideos >= 1000 ? 4 : 3;
-            using var bar = new ConsoleProgressBar("Rename");
-
-            int processed = 0;
             int globalIndex = 0, subFolderKey = 0;
             var videoFiles = new List<VideoFile>();
             var missingRows = new List<string[]>();
@@ -53,6 +49,7 @@ namespace Infrastructure
             {
                 subFolderKey++;
                 Console.WriteLine($"  - Processing sub-folder [{subFolderKey}] {Path.GetFileName(sub)}");
+
                 var filesDest = Path.Combine(_work.FilesDir, Utils.SanitizeFileName(Path.GetFileName(sub)));
                 Utils.EnsureDir(filesDest);
 
@@ -70,6 +67,7 @@ namespace Infrastructure
                 foreach (var v in videos)
                 {
                     globalIndex++;
+                    var padWidth = globalIndex >= 1000 ? 4 : 3;
                     var newStem = Utils.ZeroPad(globalIndex, padWidth);
 
                     // Video
@@ -89,16 +87,8 @@ namespace Infrastructure
                     }
                     else
                     {
-                        // Missing subtitle
                         var sNewDefault = Path.Combine(_work.SubsDir, newStem + ".srt");
                         _excel.LogSubtitle(globalIndex, subFolderKey, "(missing)", Path.GetFileName(sNewDefault));
-                        _logger.Warn($"Subtitle missing for video '{Path.GetFileName(v)}' -> expected index {newStem}");
-                        double dur = 0;
-                        try { dur = Utils.GetVideoDurationSeconds(_config, v); } catch { }
-                        missingRows.Add(new[] {
-                            Path.GetFileName(v),
-                            dur.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
-                            newStem, "missing" });
 
                         if (_opts.StrictMapping)
                             throw new Exception($"StrictMapping enabled and subtitle missing for {Path.GetFileName(v)}");
@@ -109,13 +99,8 @@ namespace Infrastructure
                             catch (Exception ex) { _logger.Warn($"Failed to create empty subtitle '{sNewDefault}': {ex.Message}"); }
                         }
                     }
-
-                    processed++;
-                    if (totalVideos > 0)
-                        bar.Report((double)processed / totalVideos);
                 }
 
-                // Copy other files
                 foreach (var other in files.Where(f => !Utils.IsVideo(f) && !Utils.IsSubtitle(f)))
                 {
                     try
@@ -130,7 +115,7 @@ namespace Infrastructure
                 }
             }
 
-            // Write missing-subtitles.csv if any
+            // missing-subtitles.csv
             if (missingRows.Count > 0)
             {
                 var csv = Path.Combine(_work.ReportDir, "missing-subtitles.csv");
@@ -140,11 +125,9 @@ namespace Infrastructure
                 File.WriteAllText(csv, sb.ToString(), new UTF8Encoding(false));
             }
 
-            bar.Done();
             return videoFiles;
         }
 
-        // Builds map from video file to its subtitle (prefers .srt):contentReference[oaicite:14]{index=14}.
         private Dictionary<string, string> BuildSubtitleMap(List<string> videos, List<string> subs)
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -175,11 +158,6 @@ namespace Infrastructure
                 }
             }
             return map;
-        }
-
-        IEnumerable<VideoFile> IFileRenamer.RenameAll(string parentFolder)
-        {
-            throw new NotImplementedException();
         }
     }
 }

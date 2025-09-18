@@ -85,7 +85,7 @@ namespace Utilities
             string subsDir,
             IEnumerable<string> videoPaths,
             RuntimeOptions opts,
-            ErrorLogger logger,
+            Infrastructure.ErrorLogger logger,
             out Dictionary<string, string> baseToSubtitlePath,
             int previewLimit = 20)
         {
@@ -191,7 +191,7 @@ namespace Utilities
             Dictionary<string, string> baseToSubtitlePath, // base "001" -> path sub (srt hoặc vtt)
             Config cfg,
             string outputSrtPath,
-            ErrorLogger logger)
+            Infrastructure.ErrorLogger logger)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(outputSrtPath)!);
 

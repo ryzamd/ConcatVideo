@@ -1,6 +1,6 @@
 using System.Text.RegularExpressions;
 
-internal class NumericNameComparer : IComparer<string>
+public class NumericNameComparer : IComparer<string>
 {
     public int Compare(string? x, string? y)
     {

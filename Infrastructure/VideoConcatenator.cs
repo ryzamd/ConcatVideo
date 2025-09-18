@@ -1,16 +1,16 @@
-﻿// Infrastructure/VideoConcatenator.cs
+﻿using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Text;
 using Domain.Entities;
 using Domain.Interfaces;
 using Domain.Models;
 using Models;
-using System.Diagnostics;
-using System.Globalization;
-using System.Runtime.InteropServices;
 using Utilities;
 
-namespace Infrastructure
+namespace MergeVideo.Infrastructure
 {
-    public class VideoConcatenator : IVideoConcatenator
+    public sealed class VideoConcatenator : IVideoConcatenator
     {
         private readonly Config _config;
         private readonly WorkDirs _work;
@@ -27,7 +27,6 @@ namespace Infrastructure
 
         public async Task<IList<VideoPart>> ConcatenateAsync(IEnumerable<VideoFile> videos, bool useGpuReencode)
         {
-            // Prepare directories
             Directory.CreateDirectory(_work.Root);
             var normDir = Path.Combine(_work.Root, "norm");
             Directory.CreateDirectory(normDir);
@@ -35,142 +34,90 @@ namespace Infrastructure
             var inputs = videos.Select(v => v.RenamedPath).ToList();
             if (inputs.Count == 0) throw new InvalidOperationException("No input files.");
 
-            // Normalize all videos (audio compliance)
-            ConsoleProgressBar.WriteHeader("[2.1/4] Normalize all video ....");
-            var normTasks = inputs.Select(src => Task.Run(async () =>
+            // 1) Normalize
+            foreach (var src in inputs)
             {
-                var info = await ProbeAudioAsync(src);
+                var srcName = Path.GetFileName(src);
+                Console.Write($"  - Normalizing {srcName} ... ");
+                var info = await ProbeAudioAsync(src).ConfigureAwait(false);
                 var dst = Path.Combine(normDir, Path.GetFileNameWithoutExtension(src) + ".norm.mkv");
-                var baseName = Path.GetFileName(src);
-                switch (GetCompliance(info))
-                {
-                    case AudioCompliance.Compliant:
-                        await RemuxCopyAsync(src, dst);
-                        break;
-                    case AudioCompliance.MissingAudio:
-                        await AddSilentAsync(src, dst);
-                        break;
-                    default:
-                        await EncodeAacAsync(src, dst, info);
-                        break;
-                }
-                Console.WriteLine($"[Norm] {baseName} done.");
-            }));
-            await Task.WhenAll(normTasks);
 
-            // Build list of normalized files in order
-            var normFiles = Directory.EnumerateFiles(normDir, "*.norm.mkv")
-                .OrderBy(n => n, new NumericNameComparer()).ToList();
-
-            // Build parts with max 2.5h threshold
-            double maxHours = 2.5;
-            double maxSec = maxHours * 3600.0;
-            var parts = new List<List<string>>();
-            var cur = new List<string>();
-            double curSec = 0;
-            foreach (var f in normFiles)
-            {
-                var dur = GetDurationSafe(f);
-                if (cur.Count > 0 && (curSec + dur) > maxSec)
+                var compliance = GetCompliance(info);
+                if (compliance == AudioCompliance.Compliant)
                 {
-                    parts.Add(cur);
-                    cur = new List<string>();
-                    curSec = 0;
+                    await RemuxCopyAsync(src, dst).ConfigureAwait(false);
+                    Console.WriteLine("copy ✔");
                 }
-                cur.Add(f);
-                curSec += dur;
+                else if (compliance == AudioCompliance.MissingAudio)
+                {
+                    await AddSilentAsync(src, dst).ConfigureAwait(false);
+                    Console.WriteLine("add-silent+aac ✔");
+                }
+                else
+                {
+                    await EncodeAacAsync(src, dst, info).ConfigureAwait(false);
+                    Console.WriteLine("aac ✔");
+                }
             }
-            if (cur.Count > 0) parts.Add(cur);
 
-            // Concatenate each part using ffmpeg concat demuxer
-            ConsoleProgressBar.WriteHeader("[2.2/4] Concatenating video:");
-            var videoParts = new List<VideoPart>();
+            // 2) Gom nhóm ≤ 2h30
+            var normFiles = Directory.EnumerateFiles(normDir, "*.norm.mkv")
+                                     .OrderBy(n => n, new NumericNameComparer())
+                                     .ToList();
+
+            const double maxHours = 2.5;
+            var partsRaw = BuildGroupsByDuration(normFiles, maxHours);
+
+            var courseFolderName = new DirectoryInfo(_work.Root).Parent?.Name ?? "Output";
+            courseFolderName = Utils.SanitizeFileName(courseFolderName);
+
+            // 3) Concat từng part
+            var result = new List<VideoPart>();
             int idx = 1;
-            foreach (var partInputs in parts)
+            foreach (var partInputs in partsRaw)
             {
-                string name = Path.GetFileNameWithoutExtension(_config.FfmpegPath); // use base output name
-                name = _config.MkvMergePath; // placeholder, actually use baseName passed in opts
-                // Build actual output name with part index (mimic original naming)
-                var parentName = Utils.SanitizeFileName(Path.GetFileName(_work.Root.TrimEnd(Path.DirectorySeparatorChar)));
-                var partName = $"{parentName} - Part {idx:00}.mkv";
-                var outPath = Path.Combine(_work.Root, partName);
+                var outName = $"{courseFolderName} - [Part {idx:00}].mkv";
+                var outPath = Path.Combine(_work.Root, outName);
 
-                // Create ffmpeg concat list file
+                Console.WriteLine($"  - Concatenate [Part {idx:00}] ({partInputs.Count} clips) -> {outName}");
+
                 var listPath = Path.Combine(_work.Root, $"concat_{idx:00}.txt");
-                using (var sw = new StreamWriter(listPath, false, new System.Text.UTF8Encoding(false)))
-                {
-                    foreach (var p in partInputs)
-                    {
-                        var safe = p.Replace("\\", "\\\\").Replace("'", "''");
-                        sw.WriteLine($"file '{safe}'");
-                    }
-                }
+                await File.WriteAllLinesAsync(
+                    listPath,
+                    partInputs.Select(p => $"file '{p.Replace("'", "''")}'"),
+                    new UTF8Encoding(false)
+                ).ConfigureAwait(false);
 
-                // Build ffmpeg args
-                string videoCodecArg = useGpuReencode
-                    ? (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "-c:v h264_vaapi -vf format=yuv420p" : "-c:v h264_nvenc -preset fast")
-                    : "-c:v copy";
+                var videoCodecArg = useGpuReencode ? BuildGpuVideoArgs() : "-c:v copy";
                 var audioArg = "-c:a copy";
-                var args = $"-f concat -safe 0 -i \"{listPath}\" {videoCodecArg} {audioArg} -fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 \"{outPath}\"";
 
-                // Run with progress
-                await ConsoleProgressBar.RunFfmpegWithProgressAsync(
-                    _config.FfmpegPath,
-                    args,
-                    totalDurationSec: partInputs.Sum(GetDurationSafe),
-                    workingDir: _work.Root,
-                    onPercent: async p => { /* progress shown automatically */ }
-                );
+                var args = $"-hide_banner -y -f concat -safe 0 -i \"{listPath}\" {videoCodecArg} {audioArg} " +
+                           "-fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 " +
+                           $"\"{outPath}\"";
 
+                RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(12));
                 try { File.Delete(listPath); } catch { }
 
-                // Map inputs to domain VideoFile objects
-                var partClips = partInputs.Select(pf =>
+                var clipsInPart = partInputs.Select(pf =>
                 {
-                    var baseName = Path.GetFileNameWithoutExtension(pf).Replace(".norm", "");
-                    return videos.First(v => Path.GetFileNameWithoutExtension(v.RenamedName) == baseName);
+                    var stem = Path.GetFileNameWithoutExtension(pf)!;
+                    if (stem.EndsWith(".norm", StringComparison.OrdinalIgnoreCase))
+                        stem = stem[..^5];
+                    return videos.First(v =>
+                        Path.GetFileNameWithoutExtension(v.RenamedName)!
+                            .Equals(stem, StringComparison.OrdinalIgnoreCase));
                 }).ToList();
 
-                videoParts.Add(new VideoPart(idx, outPath, partClips));
-
+                result.Add(new VideoPart(idx, outPath, clipsInPart));
                 idx++;
             }
 
-            // If GPU re-encode: the above already used NVENC/VAAPI in ffmpeg args.
-            // No further action needed, as encoding was done in concat step.
-
-            return videoParts;
+            return result;
         }
 
-        // Helper to run ffprobe and parse audio info
-        private async Task<AudioInfo> ProbeAudioAsync(string src)
-        {
-            return await Task.Run(() =>
-            {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = _config.FfprobePath,
-                    Arguments = $"-v error -select_streams a:0 -show_entries stream=codec_name,channels,bit_rate -of default=nw=1 \"{src}\"",
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using var p = Process.Start(psi)!;
-                var outStr = p.StandardOutput.ReadToEnd();
-                p.WaitForExit();
-                // Simple parse: if no output, missing audio.
-                if (string.IsNullOrWhiteSpace(outStr))
-                    return new AudioInfo { Codec = null, Channels = 0, BitRate = 0 };
-                var lines = outStr.Split('\n').Select(l => l.Trim()).Where(l => l.Contains('=')).ToDictionary(
-                    l => l.Substring(0, l.IndexOf('=')), l => l.Substring(l.IndexOf('=') + 1));
-                lines.TryGetValue("codec_name", out var codec);
-                int.TryParse(lines.GetValueOrDefault("channels"), out var ch);
-                int.TryParse(lines.GetValueOrDefault("bit_rate"), out var br);
-                return new AudioInfo { Codec = codec, Channels = ch, BitRate = br };
-            });
-        }
+        // ===================== helpers =====================
+        private enum AudioCompliance { Compliant, MissingAudio, Other }
 
-        private enum AudioCompliance { Compliant, MissingAudio, Other };
         private AudioCompliance GetCompliance(AudioInfo info)
         {
             if (string.IsNullOrEmpty(info.Codec)) return AudioCompliance.MissingAudio;
@@ -178,57 +125,141 @@ namespace Infrastructure
                 return AudioCompliance.Compliant;
             return AudioCompliance.Other;
         }
-        private async Task RemuxCopyAsync(string src, string dst)
+
+        private Task RemuxCopyAsync(string src, string dst)
         {
-            await Task.Run(() =>
+            return Task.Run(() =>
             {
-                File.Delete(dst);
-                Utils.FfmpegConcatCopy(new[] { src }, dst, _config.FfmpegPath);
-            });
-        }
-        private async Task AddSilentAsync(string src, string dst)
-        {
-            await Task.Run(() =>
-            {
-                File.Delete(dst);
-                var args = $"-hide_banner -y -i \"{src}\" -f lavfi -i anullsrc=cl=stereo:r=48000 -shortest -c:v copy -c:a aac -b:a 192k \"{dst}\"";
-                var psi = new ProcessStartInfo { FileName = _config.FfmpegPath, Arguments = args, UseShellExecute = false, CreateNoWindow = true };
-                using var p = Process.Start(psi)!; p.WaitForExit();
-            });
-        }
-        private async Task EncodeAacAsync(string src, string dst, AudioInfo info)
-        {
-            await Task.Run(() =>
-            {
-                File.Delete(dst);
-                var args = $"-hide_banner -y -i \"{src}\" -c:v copy -c:a aac -b:a 192k \"{dst}\"";
-                var psi = new ProcessStartInfo { FileName = _config.FfmpegPath, Arguments = args, UseShellExecute = false, CreateNoWindow = true };
-                using var p = Process.Start(psi)!; p.WaitForExit();
+                if (File.Exists(dst)) File.Delete(dst);
+                var args = $"-hide_banner -y -i \"{src}\" -c copy \"{dst}\"";
+                RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(1));
             });
         }
 
-        private double GetDurationSafe(string f)
+        private Task AddSilentAsync(string src, string dst)
         {
-            try
+            return Task.Run(() =>
             {
-                var (exit, stdout, _) = RunToolCapture(_config.FfprobePath,
-                    $"-v error -show_entries format=duration -of default=nk=1:nw=1 \"{f}\"");
-                if (exit == 0 && double.TryParse(stdout.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var sec))
-                    return sec;
+                if (File.Exists(dst)) File.Delete(dst);
+                var args = $"-hide_banner -y -i \"{src}\" -f lavfi -i anullsrc=cl=stereo:r=48000 -shortest -c:v copy -c:a aac -b:a 192k \"{dst}\"";
+                RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(1));
+            });
+        }
+
+        private Task EncodeAacAsync(string src, string dst, AudioInfo _)
+        {
+            return Task.Run(() =>
+            {
+                if (File.Exists(dst)) File.Delete(dst);
+                var args = $"-hide_banner -y -i \"{src}\" -c:v copy -c:a aac -b:a 192k \"{dst}\"";
+                RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(2));
+            });
+        }
+
+        private async Task<AudioInfo> ProbeAudioAsync(string src)
+        {
+            return await Task.Run(() =>
+            {
+                var args = $"-v error -select_streams a:0 -show_entries stream=codec_name,channels,bit_rate -of default=nw=1 \"{src}\"";
+                var (exit, stdout, _) = RunToolCapture(_config.FfprobePath, args, TimeSpan.FromSeconds(30));
+                if (exit != 0 || string.IsNullOrWhiteSpace(stdout))
+                    return new AudioInfo(null, 0, 0);
+
+                var dict = stdout.Split('\n')
+                    .Select(l => l.Trim())
+                    .Where(l => l.Contains('='))
+                    .Select(l => (k: l[..l.IndexOf('=')], v: l[(l.IndexOf('=') + 1)..]))
+                    .ToDictionary(x => x.k, x => x.v, StringComparer.OrdinalIgnoreCase);
+
+                dict.TryGetValue("codec_name", out var codec);
+                int.TryParse(dict.GetValueOrDefault("channels"), out var ch);
+                int.TryParse(dict.GetValueOrDefault("bit_rate"), out var br);
+                return new AudioInfo(codec, ch, br);
+            }).ConfigureAwait(false);
+        }
+
+        private List<List<string>> BuildGroupsByDuration(List<string> files, double maxHours)
+        {
+            var maxSec = maxHours * 3600.0;
+            var groups = new List<List<string>>();
+            var cur = new List<string>();
+            double acc = 0;
+
+            foreach (var f in files)
+            {
+                var dur = GetDurationSec(f);
+                if (cur.Count > 0 && (acc + dur) > maxSec)
+                {
+                    groups.Add(cur);
+                    cur = new List<string>();
+                    acc = 0;
+                }
+                cur.Add(f);
+                acc += dur;
             }
-            catch { }
+            if (cur.Count > 0) groups.Add(cur);
+            return groups;
+        }
+
+        private double GetDurationSec(string file)
+        {
+            // ffprobe - show duration
+            var (exit, stdout, _) = RunToolCapture(
+                _config.FfprobePath,
+                $"-v error -show_entries format=duration -of default=nk=1:nw=1 \"{file}\"",
+                TimeSpan.FromSeconds(30));
+            if (exit == 0 && double.TryParse(stdout.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var sec))
+                return sec;
             return 0;
         }
 
-        // Helper to run external process and capture output
-        private static (int ExitCode, string StdOut, string StdErr) RunToolCapture(string fileName, string args)
+        private static string BuildGpuVideoArgs()
         {
-            var psi = new ProcessStartInfo(fileName, args) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
-            using var proc = Process.Start(psi)!;
-            string outp = proc.StandardOutput.ReadToEnd();
-            string err = proc.StandardError.ReadToEnd();
-            proc.WaitForExit();
-            return (proc.ExitCode, outp, err);
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                return "-c:v h264_vaapi -vf format=nv12,hwupload";
+            // Windows / NVIDIA
+            return "-c:v h264_nvenc -preset p4 -rc:v vbr -cq:v 23";
+        }
+
+        private static void RunTool(string fileName, string args, TimeSpan timeout)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = args,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var p = Process.Start(psi)!;
+            if (!p.WaitForExit((int)timeout.TotalMilliseconds))
+            {
+                try { p.Kill(); } catch { }
+                throw new TimeoutException($"{fileName} timed out.");
+            }
+        }
+
+        private static (int ExitCode, string StdOut, string StdErr) RunToolCapture(string fileName, string args, TimeSpan timeout)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = args,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var p = Process.Start(psi)!;
+            var so = p.StandardOutput.ReadToEnd();
+            var se = p.StandardError.ReadToEnd();
+            if (!p.WaitForExit((int)timeout.TotalMilliseconds))
+            {
+                try { p.Kill(); } catch { }
+                throw new TimeoutException($"{fileName} timed out.");
+            }
+            return (p.ExitCode, so, se);
         }
     }
 }

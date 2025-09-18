@@ -1,11 +1,11 @@
-﻿using Application;
-using Domain.Interfaces;
+﻿using Domain.Interfaces;
 using Infrastructure;
+using MergeVideo.Infrastructure;
 using Models;
 
 namespace CLI
 {
-    internal static class Program
+    public static class Program
     {
         static int Main(string[] args)
         {
@@ -30,7 +30,7 @@ namespace CLI
                 ISubtitleMerger subMerger = new SubtitleMerger(cfg, errorLogger);
                 ITimelineWriter timelineWriter = new TimelineWriter(cfg);
 
-                var useCase = new MergeVideoProjectUseCase(
+                var useCase = new MergeVideo.Application.MergeVideoProjectUseCase(
                     renamer, subMapper, concatenator, subMerger, timelineWriter,
                     errorLogger, excelLogger, cfg, opts);
 

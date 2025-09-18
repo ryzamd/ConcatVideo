@@ -1,17 +1,17 @@
 ﻿using Domain.Interfaces;
 using Models;
 
-namespace Application
+namespace MergeVideo.Application
 {
     public class MergeVideoProjectUseCase
     {
         private readonly IFileRenamer _renamer;
         private readonly ISubtitleMapper _subMapper;
-        private readonly IVideoConcatenator _concatenator;
-        private readonly ISubtitleMerger _subMerger;
-        private readonly ITimelineWriter _timelineWriter;
-        private readonly IErrorLogger _errorLogger;
-        private readonly IExcelLogger _excelLogger;
+        private readonly IVideoConcatenator _concat;
+        private readonly ISubtitleMerger _subs;
+        private readonly ITimelineWriter _timeline;
+        private readonly IErrorLogger _log;
+        private readonly IExcelLogger _excel;
         private readonly Config _config;
         private readonly RuntimeOptions _opts;
 
@@ -28,51 +28,55 @@ namespace Application
         {
             _renamer = renamer;
             _subMapper = subMapper;
-            _concatenator = concatenator;
-            _subMerger = subMerger;
-            _timelineWriter = timelineWriter;
-            _errorLogger = errorLogger;
-            _excelLogger = excelLogger;
+            _concat = concatenator;
+            _subs = subMerger;
+            _timeline = timelineWriter;
+            _log = errorLogger;
+            _excel = excelLogger;
             _config = config;
             _opts = opts;
         }
 
         public async Task<int> ExecuteAsync(string parentFolder)
         {
-            // Prepare working directories
             var work = WorkDirs.Prepare(parentFolder);
-            Console.WriteLine("[1/4] Scanning sub-folders & renaming files...");
-            // Step 1: Rename files
-            var videoClips = _renamer.RenameAll(parentFolder).ToList();
-            Console.WriteLine("[green]########################### - 100%[/]");
 
-            if (videoClips.Count == 0)
+            // ===================== [1/4] Scan & Rename =====================
+            var clips = _renamer.RenameAll(parentFolder).ToList();
+            WriteCompletedBar(); // ━━━━━ 100%
+
+            if (clips.Count == 0)
             {
-                _errorLogger.Error("No videos found.");
+                _log.Error("No videos found.");
                 return 2;
             }
 
-            // Step 2: Validate subtitle mapping
-            var subMap = _subMapper.MapSubtitles(work.SubsDir, videoClips);
+            // Validate subtitle mapping (không vẽ bar riêng)
+            var subMap = _subMapper.MapSubtitles(work.SubsDir, clips);
 
-            // Step 3: Concatenate videos
-            Console.WriteLine("[2/4] Concatenating videos ...");
-            var parts = await _concatenator.ConcatenateAsync(videoClips, _opts.ReencodeVideoWithGpu);
+            // ===================== [2/4] Normalize & Concat =================
+            Console.WriteLine();
+            Console.WriteLine("[2/4] Normalize & concatenate videos...");
+            var parts = (await _concat.ConcatenateAsync(clips, _opts.ReencodeVideoWithGpu)).ToList();
+            WriteCompletedBar();
 
-            // Step 4: Write timeline and merge subtitles for each part
-            Console.WriteLine("[3/4] Merging subtitles and writing timelines...");
-            foreach (var part in parts)
+            // ===================== [3/4] Merge Subtitles + Timeline =========
+            Console.WriteLine();
+            Console.WriteLine("[3/4] Merging subtitles and writing timelines..");
+
+            foreach (var p in parts)
             {
-                // Merge subtitles for this part
-                var srtPath = Path.ChangeExtension(part.OutputPath, ".srt");
-                _subMerger.MergeSubtitles(part, subMap, srtPath);
-
-                // Write timeline
-                _timelineWriter.WriteTimeline(part, work.LogsDir);
+                var srtPath = Path.ChangeExtension(p.OutputPath, ".srt");
+                _subs.MergeSubtitles(p, subMap, srtPath);
+                _timeline.WriteTimeline(p, work.Root);
+                Console.WriteLine($"  - Merged subtitles for [Part {p.PartIndex:00}] -> {srtPath}");
             }
+            WriteCompletedBar();
 
-            // Done
-            Console.WriteLine("[4/4] Done. Outputs in: " + work.Root);
+            // ===================== [4/4] Finalize ===========================
+            Console.WriteLine();
+            Console.WriteLine("[4/4] Finalize outputs:");
+            Console.WriteLine("Outputs in: " + work.Root);
             foreach (var part in parts)
                 Console.WriteLine(" - Part video: " + part.OutputPath);
             foreach (var part in parts)
@@ -82,23 +86,32 @@ namespace Application
                     Console.WriteLine(" - Subtitle: " + srt);
             }
 
-            // Cleanup: delete work/videos folder
             try
             {
                 if (Directory.Exists(work.VideosDir))
                 {
                     Directory.Delete(work.VideosDir, true);
-                    Console.WriteLine("Cleaned up: " + work.VideosDir);
+                    Console.WriteLine();
+                    Console.WriteLine(" - Cleaned up: " + work.VideosDir);
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Warning: failed to delete {work.VideosDir}: {ex.Message}");
+                _log.Warn($"Failed to cleanup videos folder: {ex.Message}");
             }
 
-            // Save logs
-            _excelLogger.FlushAndSave();
+            _excel.FlushAndSave();
+            WriteCompletedBar();
+
             return 0;
+        }
+
+        private static void WriteCompletedBar()
+        {
+            var bar = new string('━', 46);
+            Console.WriteLine();
+            Console.WriteLine($" {bar} 100%  ");
+            Console.WriteLine();
         }
     }
 }
