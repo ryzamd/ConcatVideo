@@ -8,7 +8,7 @@ using Domain.Models;
 using Models;
 using Utilities;
 
-namespace MergeVideo.Infrastructure
+namespace Infrastructure
 {
     public sealed class VideoConcatenator : IVideoConcatenator
     {
@@ -38,7 +38,7 @@ namespace MergeVideo.Infrastructure
             foreach (var src in inputs)
             {
                 var srcName = Path.GetFileName(src);
-                Console.Write($"  - Normalizing {srcName} ... ");
+                Console.Write($"  - Normalizing {srcName} -> ");
                 var info = await ProbeAudioAsync(src).ConfigureAwait(false);
                 var dst = Path.Combine(normDir, Path.GetFileNameWithoutExtension(src) + ".norm.mkv");
 
@@ -112,6 +112,50 @@ namespace MergeVideo.Infrastructure
                 idx++;
             }
 
+            return result;
+        }
+
+        // === NEW: NormalizeOnlyAsync (chỉ làm lại những clip thiếu) ===
+        public Task NormalizeOnlyAsync(IEnumerable<VideoFile> videosToNormalize)
+        {
+            Directory.CreateDirectory(Path.Combine(_work.Root, "norm"));
+            return Task.WhenAll(videosToNormalize.Select(async v =>
+            {
+                var src = v.RenamedPath;
+                var info = await ProbeAudioAsync(src).ConfigureAwait(false);
+                var dst = Path.Combine(_work.Root, "norm", Path.GetFileNameWithoutExtension(src) + ".norm.mkv");
+
+                var compliance = GetCompliance(info);
+                if (compliance == AudioCompliance.Compliant) await RemuxCopyAsync(src, dst);
+                else if (compliance == AudioCompliance.MissingAudio) await AddSilentAsync(src, dst);
+                else await EncodeAacAsync(src, dst, info);
+            }));
+        }
+
+        // === NEW: ConcatPartsFromNormAsync (concat 1..n part từ danh sách norm có sẵn) ===
+        public async Task<IList<VideoPart>> ConcatPartsFromNormAsync(IEnumerable<(int partIndex, IList<string> normFiles, string outMkvName)> specs, bool useGpuReencode, IEnumerable<VideoFile> allVideos)
+        {
+            var result = new List<VideoPart>();
+            foreach (var (partIndex, normFiles, outName) in specs)
+            {
+                var listPath = Path.Combine(_work.Root, $"concat_{partIndex:00}.txt");
+                await File.WriteAllLinesAsync(listPath, normFiles.Select(n => $"file '{Path.Combine(_work.Root, "norm", n).Replace("'", "''")}'"), new UTF8Encoding(false));
+                var outPath = Path.Combine(_work.Root, outName);
+                var videoCodecArg = useGpuReencode ? BuildGpuVideoArgs() : "-c:v copy";
+                var args = $"-hide_banner -y -f concat -safe 0 -i \"{listPath}\" {videoCodecArg} -c:a copy -fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 \"{outPath}\"";
+                RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(12));
+                try { File.Delete(listPath); } catch { }
+
+                var clips = new List<VideoFile>();
+                foreach (var n in normFiles)
+                {
+                    var stem = Path.GetFileNameWithoutExtension(n)!; // "001.norm"
+                    var renamed = stem.EndsWith(".norm", StringComparison.OrdinalIgnoreCase) ? stem[..^5] : stem;
+                    var vf = allVideos.First(v => Path.GetFileNameWithoutExtension(v.RenamedName)!.Equals(renamed, StringComparison.OrdinalIgnoreCase));
+                    clips.Add(vf);
+                }
+                result.Add(new VideoPart(partIndex, outPath, clips));
+            }
             return result;
         }
 
@@ -232,15 +276,17 @@ namespace MergeVideo.Infrastructure
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
-            using var p = Process.Start(psi)!;
+
+            using var p = ProcessManager.Start(psi);
+
             if (!p.WaitForExit((int)timeout.TotalMilliseconds))
             {
-                try { p.Kill(); } catch { }
+                try { p.Kill(true); } catch { }
                 throw new TimeoutException($"{fileName} timed out.");
             }
         }
 
-        private static (int ExitCode, string StdOut, string StdErr) RunToolCapture(string fileName, string args, TimeSpan timeout)
+        private static (int Exit, string StdOut, string StdErr) RunToolCapture(string fileName, string args, TimeSpan timeout)
         {
             var psi = new ProcessStartInfo
             {
@@ -251,14 +297,17 @@ namespace MergeVideo.Infrastructure
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
-            using var p = Process.Start(psi)!;
+
+            using var p = ProcessManager.Start(psi);
             var so = p.StandardOutput.ReadToEnd();
             var se = p.StandardError.ReadToEnd();
+
             if (!p.WaitForExit((int)timeout.TotalMilliseconds))
             {
-                try { p.Kill(); } catch { }
+                try { p.Kill(true); } catch { }
                 throw new TimeoutException($"{fileName} timed out.");
             }
+
             return (p.ExitCode, so, se);
         }
     }

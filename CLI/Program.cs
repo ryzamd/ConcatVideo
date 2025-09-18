@@ -1,6 +1,6 @@
-﻿using Domain.Interfaces;
+﻿using Application;
+using Domain.Interfaces;
 using Infrastructure;
-using MergeVideo.Infrastructure;
 using Models;
 
 namespace CLI
@@ -9,6 +9,7 @@ namespace CLI
     {
         static int Main(string[] args)
         {
+            _ = typeof(ProcessManager);
             Console.OutputEncoding = System.Text.Encoding.UTF8;
 
             try
@@ -29,10 +30,12 @@ namespace CLI
                 IVideoConcatenator concatenator = new VideoConcatenator(cfg, work, errorLogger, opts);
                 ISubtitleMerger subMerger = new SubtitleMerger(cfg, errorLogger);
                 ITimelineWriter timelineWriter = new TimelineWriter(cfg);
+                IMediaInfoService mediaInfoService = new MediaInfoService(cfg);
+                IProcessingLogService processingLogService = new ProcessingLogService(work, errorLogger);
 
-                var useCase = new MergeVideo.Application.MergeVideoProjectUseCase(
+                var useCase = new MergeVideoProjectUseCase(
                     renamer, subMapper, concatenator, subMerger, timelineWriter,
-                    errorLogger, excelLogger, cfg, opts);
+                    errorLogger, excelLogger, cfg, opts, mediaInfoService, processingLogService);
 
                 return useCase.ExecuteAsync(root).GetAwaiter().GetResult();
             }

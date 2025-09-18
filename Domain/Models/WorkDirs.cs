@@ -9,6 +9,7 @@
         public string LogsDir { get; init; } = default!;
         public string ReportDir { get; init; } = default!;
         public string FilesDir { get; init; } = default!;
+        public string NormDir { get; init; } = default!;
 
         public static WorkDirs Prepare(string parent)
         {
@@ -22,7 +23,8 @@
                 PathDir = Path.Combine(workRoot, "path"),
                 LogsDir = Path.Combine(workRoot, "logs"),
                 ReportDir = Path.Combine(workRoot, "report"),
-                FilesDir = Path.Combine(workRoot, "files")
+                FilesDir = Path.Combine(workRoot, "files"),
+                NormDir = Path.Combine(workRoot, "norm")
             };
             EnsureDir(wd.VideosDir);
             EnsureDir(wd.SubsDir);
@@ -30,10 +32,11 @@
             EnsureDir(wd.LogsDir);
             EnsureDir(wd.ReportDir);
             EnsureDir(wd.FilesDir);
+            EnsureDir(wd.NormDir);
             return wd;
         }
 
-        internal static void EnsureDir(string dir)
+        public static void EnsureDir(string dir)
         {
             if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
         }
