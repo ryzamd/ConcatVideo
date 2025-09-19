@@ -137,9 +137,9 @@ namespace Infrastructure
                 FileName = ffmpegPath,
                 Arguments = args,
                 WorkingDirectory = string.IsNullOrWhiteSpace(workingDir) ? Environment.CurrentDirectory : workingDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
                 UseShellExecute = false,
-                RedirectStandardOutput = true,   // progress
-                RedirectStandardError = true,    // để debug
                 CreateNoWindow = true,
             };
 

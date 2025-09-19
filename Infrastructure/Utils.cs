@@ -49,10 +49,12 @@ namespace Utilities
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+
             using var p = Process.Start(psi)!;
             string output = p.StandardOutput.ReadToEnd();
             string err = p.StandardError.ReadToEnd();
             p.WaitForExit();
+
             if (p.ExitCode != 0) throw new Exception($"ffprobe failed for {mediaPath}: {err}");
             return output.Trim();
         }
@@ -326,7 +328,6 @@ namespace Utilities
             }
         }
 
-        /// Concat demuxer (-c copy) cho danh sách input đã đúng thứ tự (không re-encode).
         internal static int FfmpegConcatCopy(IReadOnlyList<string> orderedInputs, string outputPath, string ffmpegPath, Action<string>? log = null)
         {
             if (orderedInputs == null || orderedInputs.Count == 0)
@@ -358,10 +359,12 @@ namespace Utilities
             };
 
             using var proc = Process.Start(psi)!;
+
             proc.OutputDataReceived += (_, e) => { if (e.Data != null) log?.Invoke(e.Data); };
             proc.ErrorDataReceived += (_, e) => { if (e.Data != null) log?.Invoke(e.Data); };
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
+
             proc.WaitForExit();
 
             try { File.Delete(listPath); } catch { /* ignore */ }

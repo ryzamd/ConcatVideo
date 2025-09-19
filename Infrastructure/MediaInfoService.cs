@@ -12,20 +12,39 @@ namespace Infrastructure
 
         public double GetDurationSec(string fullPath)
         {
+            var (exit, stdout, _) = RunToolCapture(
+                _config.FfprobePath,
+                $"-v error -show_entries format=duration -of default=nk=1:nw=1 \"{fullPath}\"",
+                TimeSpan.FromSeconds(30));
+
+            if (exit == 0 && double.TryParse(stdout.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var sec))
+                return sec;
+            return 0;
+        }
+
+        private static (int Exit, string StdOut, string StdErr) RunToolCapture(string fileName, string args, TimeSpan timeout)
+        {
             var psi = new ProcessStartInfo
             {
-                FileName = _config.FfprobePath,
-                Arguments = $"-v error -show_entries format=duration -of default=nk=1:nw=1 \"{fullPath}\"",
+                FileName = fileName,
+                Arguments = args,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+
             using var p = ProcessManager.Start(psi);
             var so = p.StandardOutput.ReadToEnd();
-            p.WaitForExit();
-            if (double.TryParse(so.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var sec)) return sec;
-            return 0;
+            var se = p.StandardError.ReadToEnd();
+
+            if (!p.WaitForExit((int)timeout.TotalMilliseconds))
+            {
+                try { p.Kill(true); } catch { }
+                throw new TimeoutException($"{fileName} timed out.");
+            }
+
+            return (p.ExitCode, so, se);
         }
 
         public string ComputeSha1(string fullPath)

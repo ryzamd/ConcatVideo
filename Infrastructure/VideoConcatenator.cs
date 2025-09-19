@@ -271,8 +271,6 @@ namespace Infrastructure
             {
                 FileName = fileName,
                 Arguments = args,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };

@@ -4,6 +4,7 @@ using System.Text;
 using Domain.Interfaces;
 using Domain.Models;
 using Models;
+using Infrastructure;
 
 namespace Application;
 
@@ -52,57 +53,35 @@ public sealed class HealMissingMkvPartsAction : IHealingAction
 
             // FFmpeg concat stream-copy (nhanh, không re-encode)
             var ffmpeg = _config.FfmpegPath;
-            var args = $"-y -f concat -safe 0 -i \"{concatList}\" -c copy \"{outPath}\"";
+            var args = $"-hide_banner -y -f concat -safe 0 -i \"{concatList}\" -c copy \"{outPath}\"";
 
-            var ok = await RunFfmpegAsync(ffmpeg, args, killOnCtrlC: true);
-            if (!ok)
-            {
-                _logger.Warn($"Failed to rebuild MKV for Part {part.PartIndex:00}");
-            }
+            RunTool(ffmpeg, args, TimeSpan.FromHours(6));
+
+            try { File.Delete(concatList); } catch { }
         }
     }
 
-    private static async Task<bool> RunFfmpegAsync(string exe, string args, bool killOnCtrlC)
+    private static void RunTool(string fileName, string args, TimeSpan timeout)
     {
         var psi = new ProcessStartInfo
         {
-            FileName = exe,
+            FileName = fileName,
             Arguments = args,
             UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
             CreateNoWindow = true
         };
 
-        using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
-        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var p = ProcessManager.Start(psi);
 
-        // Đọc output để tránh deadlock
-        p.OutputDataReceived += (_, __) => { };
-        p.ErrorDataReceived += (_, __) => { };
-
-        ConsoleCancelEventHandler? onCancel = null;
-        if (killOnCtrlC)
+        if (!p.WaitForExit((int)timeout.TotalMilliseconds))
         {
-            onCancel = (_, __) =>
-            {
-                try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
-            };
-            Console.CancelKeyPress += onCancel;
+            try { p.Kill(true); } catch { }
+            throw new TimeoutException($"{fileName} timed out.");
         }
 
-        try
+        if (p.ExitCode != 0)
         {
-            if (!p.Start()) return false;
-            p.BeginOutputReadLine();
-            p.BeginErrorReadLine();
-            p.Exited += (_, __) => tcs.TrySetResult(p.ExitCode == 0);
-            return await tcs.Task.ConfigureAwait(false);
-        }
-        finally
-        {
-            if (onCancel != null) Console.CancelKeyPress -= onCancel;
-            try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+            throw new InvalidOperationException($"{fileName} failed with exit code {p.ExitCode}");
         }
     }
 }
