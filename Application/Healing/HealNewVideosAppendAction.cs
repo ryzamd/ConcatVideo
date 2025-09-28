@@ -58,7 +58,7 @@ namespace Application.Healing
             }
 
             // 3) Bù thêm vào Part cuối
-            const double MAX_SEC = 2.5 * 3600;
+            const double MAX_SEC = 4.5 * 3600;
             var last = log.Parts.OrderBy(p => p.PartIndex).LastOrDefault();
             var course = new DirectoryInfo(work.Root).Parent?.Name ?? "Output";
 

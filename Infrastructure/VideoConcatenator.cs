@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -31,89 +32,130 @@ namespace Infrastructure
             var normDir = Path.Combine(_work.Root, "norm");
             Directory.CreateDirectory(normDir);
 
-            var inputs = videos.Select(v => v.RenamedPath).ToList();
-            if (inputs.Count == 0) throw new InvalidOperationException("No input files.");
+            // 0) Chốt thứ tự NGUỒN ngay từ đầu (ổn định, không phụ thuộc FS)
+            var orderedVideos = videos
+                .OrderBy(v => v.RenamedName, new NumericNameComparer())
+                .ToList();
+            if (orderedVideos.Count == 0)
+                throw new InvalidOperationException("No input files.");
 
-            // 1) Normalize
-            foreach (var src in inputs)
+            // 1) Normalize (song song) nhưng GIỮ THỨ TỰ qua mảng kết quả
+            var normPaths = new string[orderedVideos.Count];
+            var degree = Math.Max(1, Environment.ProcessorCount - 1);
+            using (var sem = new SemaphoreSlim(degree, degree))
             {
-                var srcName = Path.GetFileName(src);
-                Console.Write($"  - Normalizing {srcName} -> ");
-                var info = await ProbeAudioAsync(src).ConfigureAwait(false);
-                var dst = Path.Combine(normDir, Path.GetFileNameWithoutExtension(src) + ".norm.mkv");
+                var tasks = new List<Task>();
+                for (int i = 0; i < orderedVideos.Count; i++)
+                {
+                    int idx = i; // capture
+                    await sem.WaitAsync().ConfigureAwait(false);
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var src = orderedVideos[idx].RenamedPath;
+                            var srcName = Path.GetFileName(src);
+                            Console.Write($"  - Normalizing {srcName} -> ");
 
-                var compliance = GetCompliance(info);
-                if (compliance == AudioCompliance.Compliant)
-                {
-                    await RemuxCopyAsync(src, dst).ConfigureAwait(false);
-                    Console.WriteLine("copy ✔");
+                            var info = await ProbeAudioAsync(src).ConfigureAwait(false);
+                            var dst = Path.Combine(normDir,
+                                Path.GetFileNameWithoutExtension(src) + ".norm.mkv");
+
+                            var compliance = GetCompliance(info);
+                            if (compliance == AudioCompliance.MissingAudio)
+                            {
+                                await AddSilentAsync(src, dst).ConfigureAwait(false);
+                                Console.WriteLine("silent+aac ✔");
+                            }
+                            else
+                            {
+                                // audio re-encode + aresample để triệt drift; video copy
+                                await EncodeAacAsync(src, dst, info).ConfigureAwait(false);
+                                Console.WriteLine("aac norm ✔");
+                            }
+
+                            // Ghi đích theo CHỈ SỐ để bảo toàn thứ tự
+                            normPaths[idx] = dst;
+                        }
+                        finally { sem.Release(); }
+                    }));
                 }
-                else if (compliance == AudioCompliance.MissingAudio)
-                {
-                    await AddSilentAsync(src, dst).ConfigureAwait(false);
-                    Console.WriteLine("add-silent+aac ✔");
-                }
-                else
-                {
-                    await EncodeAacAsync(src, dst, info).ConfigureAwait(false);
-                    Console.WriteLine("aac ✔");
-                }
+                await Task.WhenAll(tasks).ConfigureAwait(false);
             }
 
-            // 2) Gom nhóm ≤ 2h30
-            var normFiles = Directory.EnumerateFiles(normDir, "*.norm.mkv")
-                                     .OrderBy(n => n, new NumericNameComparer())
-                                     .ToList();
-
-            const double maxHours = 2.5;
-            var partsRaw = BuildGroupsByDuration(normFiles, maxHours);
+            // 2) Group theo thời lượng dựa trên THỨ TỰ normPaths (KHÔNG đọc lại thư mục)
+            var normFilesOrdered = normPaths.Where(p => !string.IsNullOrEmpty(p)).ToList();
+            const double maxHours = 4.5; // hoặc 2.5/3.0 tùy bạn
+            var partsRaw = BuildGroupsByDuration(normFilesOrdered, maxHours);
 
             var courseFolderName = new DirectoryInfo(_work.Root).Parent?.Name ?? "Output";
             courseFolderName = Utils.SanitizeFileName(courseFolderName);
 
-            // 3) Concat từng part
-            var result = new List<VideoPart>();
-            int idx = 1;
-            foreach (var partInputs in partsRaw)
+            // 3) Concat từng part (song song 2–3 luồng) – stream-copy để rất nhanh
+            var result = new ConcurrentBag<VideoPart>();
+            int nextIndex = 1;
+            var jobs = new List<(int partIndex, List<string> inputs)>();
+            foreach (var group in partsRaw) { jobs.Add((nextIndex++, group)); }
+
+            int degreeConcat = Math.Min(3, Math.Max(1, Environment.ProcessorCount / 2));
+            using var sem2 = new SemaphoreSlim(degreeConcat, degreeConcat);
+            var concatTasks = new List<Task>();
+
+            foreach (var job in jobs)
             {
-                var outName = $"{courseFolderName} - [Part {idx:00}].mkv";
-                var outPath = Path.Combine(_work.Root, outName);
-
-                Console.WriteLine($"  - Concatenate [Part {idx:00}] ({partInputs.Count} clips) -> {outName}");
-
-                var listPath = Path.Combine(_work.Root, $"concat_{idx:00}.txt");
-                await File.WriteAllLinesAsync(
-                    listPath,
-                    partInputs.Select(p => $"file '{p.Replace("'", "''")}'"),
-                    new UTF8Encoding(false)
-                ).ConfigureAwait(false);
-
-                var videoCodecArg = useGpuReencode ? BuildGpuVideoArgs() : "-c:v copy";
-                var audioArg = "-c:a copy";
-
-                var args = $"-hide_banner -y -f concat -safe 0 -i \"{listPath}\" {videoCodecArg} {audioArg} " +
-                           "-fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 " +
-                           $"\"{outPath}\"";
-
-                RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(12));
-                try { File.Delete(listPath); } catch { }
-
-                var clipsInPart = partInputs.Select(pf =>
+                await sem2.WaitAsync().ConfigureAwait(false);
+                concatTasks.Add(Task.Run(async () =>
                 {
-                    var stem = Path.GetFileNameWithoutExtension(pf)!;
-                    if (stem.EndsWith(".norm", StringComparison.OrdinalIgnoreCase))
-                        stem = stem[..^5];
-                    return videos.First(v =>
-                        Path.GetFileNameWithoutExtension(v.RenamedName)!
-                            .Equals(stem, StringComparison.OrdinalIgnoreCase));
-                }).ToList();
+                    try
+                    {
+                        int partIndex = job.partIndex;
+                        var partInputs = job.inputs;
 
-                result.Add(new VideoPart(idx, outPath, clipsInPart));
-                idx++;
+                        var outName = $"{courseFolderName} - [Part {partIndex:00}].mkv";
+                        var outPath = Path.Combine(_work.Root, outName);
+                        Console.WriteLine($"  - Concatenate [Part {partIndex:00}] ({partInputs.Count} clips) -> {outName}");
+
+                        var listPath = Path.Combine(_work.Root, $"concat_{partIndex:00}.txt");
+                        await File.WriteAllLinesAsync(
+                            listPath,
+                            partInputs.Select(p => $"file '{p.Replace("'", "''")}'"),
+                            new UTF8Encoding(false)
+                        ).ConfigureAwait(false);
+
+                        var videoCodecArg = useGpuReencode ? BuildGpuVideoArgs() : "-c:v copy";
+                        var audioArg = "-c:a copy"; // stream-copy audio (đầu vào đã đồng nhất)
+
+                        var args =
+                            $"-hide_banner -y -f concat -safe 0 -i \"{listPath}\" " +
+                            $"{videoCodecArg} {audioArg} " +
+                            "-fps_mode auto -avoid_negative_ts make_zero " +
+                            "-max_interleave_delta 0 -max_muxing_queue_size 9999 " +
+                            $"\"{outPath}\"";
+
+                        RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(12));
+                        try { File.Delete(listPath); } catch { }
+
+                        // map lại danh sách clip gốc cho Part (phục vụ merge sub/timeline)
+                        var clipsInPart = partInputs.Select(pf =>
+                        {
+                            var stem = Path.GetFileNameWithoutExtension(pf)!;
+                            if (stem.EndsWith(".norm", StringComparison.OrdinalIgnoreCase))
+                                stem = stem[..^5];
+                            return orderedVideos.First(v =>
+                                Path.GetFileNameWithoutExtension(v.RenamedName)!
+                                    .Equals(stem, StringComparison.OrdinalIgnoreCase));
+                        }).ToList();
+
+                        result.Add(new VideoPart(partIndex, outPath, clipsInPart));
+                    }
+                    finally { sem2.Release(); }
+                }));
             }
 
-            return result;
+            await Task.WhenAll(concatTasks).ConfigureAwait(false);
+            return result.OrderBy(r => r.PartIndex).ToList();
         }
+
 
         // === NEW: NormalizeOnlyAsync (chỉ làm lại những clip thiếu) ===
         public Task NormalizeOnlyAsync(IEnumerable<VideoFile> videosToNormalize)
@@ -142,7 +184,14 @@ namespace Infrastructure
                 await File.WriteAllLinesAsync(listPath, normFiles.Select(n => $"file '{Path.Combine(_work.Root, "norm", n).Replace("'", "''")}'"), new UTF8Encoding(false));
                 var outPath = Path.Combine(_work.Root, outName);
                 var videoCodecArg = useGpuReencode ? BuildGpuVideoArgs() : "-c:v copy";
-                var args = $"-hide_banner -y -f concat -safe 0 -i \"{listPath}\" {videoCodecArg} -c:a copy -fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 \"{outPath}\"";
+                var audioArg = "-c:a copy";
+
+                var args = $"-hide_banner -y -f concat -safe 0 -i \"{listPath}\" " +
+                           $"{videoCodecArg} {audioArg} " +
+                           "-fps_mode auto -avoid_negative_ts make_zero " +
+                           "-max_interleave_delta 0 -max_muxing_queue_size 9999 " +
+                           $"\"{outPath}\"";
+
                 RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(12));
                 try { File.Delete(listPath); } catch { }
 
@@ -164,18 +213,28 @@ namespace Infrastructure
 
         private AudioCompliance GetCompliance(AudioInfo info)
         {
-            if (string.IsNullOrEmpty(info.Codec)) return AudioCompliance.MissingAudio;
-            if (info.Codec.Equals("aac", StringComparison.OrdinalIgnoreCase) && info.Channels == 2 && info.BitRate > 0)
+            if (string.IsNullOrEmpty(info.Codec))
+                return AudioCompliance.MissingAudio;
+
+            if (info.Codec.Equals("aac", StringComparison.OrdinalIgnoreCase) &&
+                info.Channels == 2 &&
+                info.SampleRate == 44100)
                 return AudioCompliance.Compliant;
+
             return AudioCompliance.Other;
         }
 
         private Task RemuxCopyAsync(string src, string dst)
         {
+            // Re-encode audio with aresample to normalize timestamps; keep video as copy
             return Task.Run(() =>
             {
                 if (File.Exists(dst)) File.Delete(dst);
-                var args = $"-hide_banner -y -i \"{src}\" -c copy \"{dst}\"";
+                var args = $"-hide_banner -y -nostdin -v error -stats -i \"{src}\" " +
+                          "-map 0:v:0? -map 0:a:0? -map -0:d -map -0:s " +
+                          "-c:v copy -af aresample=async=1:first_pts=0 " +
+                          "-c:a aac -aac_coder fast -ar 44100 -ac 2 -b:a 160k " +
+                          $"\"{dst}\"";
                 RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(1));
             });
         }
@@ -185,29 +244,37 @@ namespace Infrastructure
             return Task.Run(() =>
             {
                 if (File.Exists(dst)) File.Delete(dst);
-                var args = $"-hide_banner -y -i \"{src}\" -f lavfi -i anullsrc=cl=stereo:r=48000 -shortest -c:v copy -c:a aac -b:a 192k \"{dst}\"";
+                var args = $"-hide_banner -y -nostdin -v error -stats -i \"{src}\" -f lavfi -i anullsrc=cl=stereo:r=44100 " +
+                          "-shortest -map 0:v:0? -map 1:a:0 " +
+                          "-c:v copy -af aresample=async=1:first_pts=0 " +
+                          "-c:a aac -aac_coder fast -ar 44100 -ac 2 -b:a 160k " +
+                          $"\"{dst}\"";
                 RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(1));
             });
         }
-
-        private Task EncodeAacAsync(string src, string dst, AudioInfo _)
+        private Task EncodeAacAsync(string src, string dst, AudioInfo info)
         {
             return Task.Run(() =>
             {
                 if (File.Exists(dst)) File.Delete(dst);
-                var args = $"-hide_banner -y -i \"{src}\" -c:v copy -c:a aac -b:a 192k \"{dst}\"";
+                var args = $"-hide_banner -y -nostdin -v error -stats -i \"{src}\" " +
+                          "-map 0:v:0? -map 0:a:0? -map -0:d -map -0:s " +
+                          "-c:v copy -af aresample=async=1:first_pts=0 " +
+                          "-c:a aac -aac_coder fast -ar 44100 -ac 2 -b:a 160k " +
+                          $"\"{dst}\"";
                 RunTool(_config.FfmpegPath, args, TimeSpan.FromHours(2));
             });
+
         }
 
         private async Task<AudioInfo> ProbeAudioAsync(string src)
         {
             return await Task.Run(() =>
             {
-                var args = $"-v error -select_streams a:0 -show_entries stream=codec_name,channels,bit_rate -of default=nw=1 \"{src}\"";
+                var args = $"-v error -select_streams a:0 -show_entries stream=codec_name,channels,bit_rate,sample_rate -of default=nw=1 \"{src}\"";
                 var (exit, stdout, _) = RunToolCapture(_config.FfprobePath, args, TimeSpan.FromSeconds(30));
                 if (exit != 0 || string.IsNullOrWhiteSpace(stdout))
-                    return new AudioInfo(null, 0, 0);
+                    return new AudioInfo(null, 0, 0, 0);
 
                 var dict = stdout.Split('\n')
                     .Select(l => l.Trim())
@@ -217,8 +284,22 @@ namespace Infrastructure
 
                 dict.TryGetValue("codec_name", out var codec);
                 int.TryParse(dict.GetValueOrDefault("channels"), out var ch);
-                int.TryParse(dict.GetValueOrDefault("bit_rate"), out var br);
-                return new AudioInfo(codec, ch, br);
+
+                var bitrateStr = dict.GetValueOrDefault("bit_rate", "0");
+                int br = 0;
+                if (!string.Equals(bitrateStr, "N/A", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(bitrateStr, out br);
+                }
+
+                var sampleRateStr = dict.GetValueOrDefault("sample_rate", "0");
+                int sr = 0;
+                if (!string.Equals(sampleRateStr, "N/A", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(sampleRateStr, out sr);
+                }
+
+                return new AudioInfo(codec, ch, br, sr);
             }).ConfigureAwait(false);
         }
 
@@ -241,6 +322,7 @@ namespace Infrastructure
                 cur.Add(f);
                 acc += dur;
             }
+
             if (cur.Count > 0) groups.Add(cur);
             return groups;
         }

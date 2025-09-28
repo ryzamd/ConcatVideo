@@ -96,7 +96,9 @@ namespace Application
             // [1/4] Scan & rename
             Console.WriteLine();
             Console.WriteLine("[1/4] Renaming videos and subtitles..");
-            var clips = _renamer.RenameAll(parentFolder).ToList();
+            var clips = _renamer.RenameAll(parentFolder)
+                    .OrderBy(c => c.RenamedName, new NumericNameComparer())
+                    .ToList();
             WriteCompletedBar();
 
             // build processing.json (rename + checksum)
@@ -129,7 +131,7 @@ namespace Application
             _procLog.Save(proc);
 
             // [2/4] Normalize & concat
-            Console.WriteLine();
+            Console.WriteLine($"Total videos were found: {clips.Count} videos");
             Console.WriteLine("[2/4] Normalizing and concatening videos..");
             var parts = (await _concat.ConcatenateAsync(clips, _opts.ReencodeVideoWithGpu)).ToList();
             WriteCompletedBar();
@@ -161,7 +163,6 @@ namespace Application
             _procLog.Save(proc);
 
             // [3/4] Merge subtitles + timeline
-            Console.WriteLine();
             Console.WriteLine("[3/4] Merging subtitles and writing timelines..");
             var subMap = _subMapper.MapSubtitles(work.SubsDir, clips);
             foreach (var p in parts)
@@ -174,7 +175,6 @@ namespace Application
             WriteCompletedBar();
 
             // [4/4] Finalize
-            Console.WriteLine();
             Console.WriteLine("[4/4] Finalize outputs:");
             Console.WriteLine("Outputs in: " + work.Root);
             foreach (var p in parts) Console.WriteLine(" - Part video: " + p.OutputPath);

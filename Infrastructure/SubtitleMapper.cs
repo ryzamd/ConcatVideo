@@ -65,7 +65,7 @@ namespace Infrastructure
 
             if (missing.Count > 0)
             {
-                var msg = $"Missing subtitles for {missing.Count} file(s).";
+                var msg = $"Missing subtitles for {missing.Count} file(s): {string.Join(", ", missing.Take(20))}";
                 if (_opts.StrictMapping) { _logger.Error(msg); throw new Exception("Missing subtitles."); }
 
                 if (_opts.OnMissingSubtitle == OnMissingSubtitleMode.CreateEmptyFile)

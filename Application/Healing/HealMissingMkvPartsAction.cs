@@ -53,7 +53,10 @@ public sealed class HealMissingMkvPartsAction : IHealingAction
 
             // FFmpeg concat stream-copy (nhanh, không re-encode)
             var ffmpeg = _config.FfmpegPath;
-            var args = $"-hide_banner -y -f concat -safe 0 -i \"{concatList}\" -c copy \"{outPath}\"";
+            var args = $"-hide_banner -y -f concat -safe 0 -i \"{concatList}\" -c:v copy -c:a copy " +
+                       "-async 1 -vsync cfr -fflags +genpts -avoid_negative_ts make_zero " +
+                       "-max_interleave_delta 0 -max_muxing_queue_size 9999 " +
+                       $"\"{outPath}\"";
 
             RunTool(ffmpeg, args, TimeSpan.FromHours(6));
 

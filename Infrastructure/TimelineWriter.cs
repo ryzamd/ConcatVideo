@@ -32,7 +32,7 @@ namespace Infrastructure
                 // ưu tiên tên gốc; fallback: tên đã rename
                 var original = clip.OriginalName ?? Path.GetFileName(clip.RenamedPath);
                 var title = MakeTitleFromOriginal(original);
-                sw.WriteLine($"{stamp}: {title}");
+                sw.WriteLine($"{stamp}  {title}");
 
                 var durSec = Utils.GetVideoDurationSeconds(_config, clip.RenamedPath);
                 acc = acc.Add(TimeSpan.FromSeconds(durSec));

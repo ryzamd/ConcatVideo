@@ -102,22 +102,35 @@ namespace Infrastructure
                     {
                         var sNew = newStem + Path.GetExtension(sPath).ToLowerInvariant();
                         var sNewPath = Path.Combine(_work.SubsDir, sNew);
-                        File.Copy(sPath, sNewPath, true);
-                        _excel.LogSubtitle(globalIndex, subFolderKey, Path.GetFileName(sPath)!, sNew);
+
+                        // If source is .vtt, convert to .srt
+                        if (sPath.EndsWith(".vtt", StringComparison.OrdinalIgnoreCase))
+                        {
+                            sNew = newStem + ".srt";
+                            sNewPath = Path.Combine(_work.SubsDir, sNew);
+
+                            // Convert VTT to SRT
+                            if (ConvertVttToSrt(sPath, sNewPath))
+                            {
+                                _excel.LogSubtitle(globalIndex, subFolderKey, Path.GetFileName(sPath)!, sNew);
+                            }
+                            else
+                            {
+                                // If conversion failed, copy as-is
+                                File.Copy(sPath, sNewPath, true);
+                                _excel.LogSubtitle(globalIndex, subFolderKey, Path.GetFileName(sPath)!, sNew);
+                            }
+                        }
+                        else
+                        {
+                            // Copy .srt directly
+                            File.Copy(sPath, sNewPath, true);
+                            _excel.LogSubtitle(globalIndex, subFolderKey, Path.GetFileName(sPath)!, sNew);
+                        }
                     }
                     else
                     {
-                        var sNewDefault = Path.Combine(_work.SubsDir, newStem + ".srt");
-                        _excel.LogSubtitle(globalIndex, subFolderKey, "(missing)", Path.GetFileName(sNewDefault)!);
-
-                        if (_opts.StrictMapping)
-                            throw new Exception($"StrictMapping enabled and subtitle missing for {Path.GetFileName(v)!}");
-
-                        if (_opts.OnMissingSubtitle == OnMissingSubtitleMode.CreateEmptyFile)
-                        {
-                            try { File.WriteAllText(sNewDefault, string.Empty, new UTF8Encoding(false)); }
-                            catch (Exception ex) { _logger.Warn($"Failed to create empty subtitle '{sNewDefault}': {ex.Message}"); }
-                        }
+                        _excel.LogMissingSubtitle(globalIndex, subFolderKey, Path.GetFileName(v)!);
                     }
                 }
 
@@ -199,6 +212,63 @@ namespace Infrastructure
                 }
             }
             return map;
+        }
+
+        private bool ConvertVttToSrt(string vttPath, string srtPath)
+        {
+            try
+            {
+                var lines = File.ReadAllLines(vttPath, Encoding.UTF8).ToList();
+
+                // Remove WEBVTT header
+                if (lines.Count > 0 && lines[0].Trim().Equals("WEBVTT", StringComparison.OrdinalIgnoreCase))
+                {
+                    lines.RemoveAt(0);
+                    while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[0]))
+                        lines.RemoveAt(0);
+                }
+
+                using var sw = new StreamWriter(srtPath, false, new UTF8Encoding(false));
+                int globIndex = 0, i = 0;
+
+                while (i < lines.Count)
+                {
+                    // Skip cue identifier if exists
+                    if (i + 1 < lines.Count && HelperSRTVTT.IsVttTimelineLine(lines[i + 1]))
+                        i++;
+
+                    if (i >= lines.Count || !HelperSRTVTT.IsVttTimelineLine(lines[i]))
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    var timeLine = lines[i++];
+                    if (!HelperSRTVTT.TryParseVttTimeline(timeLine, out var startMs, out var endMs))
+                        continue;
+
+                    var textLines = new List<string>();
+                    while (i < lines.Count && !string.IsNullOrWhiteSpace(lines[i]))
+                        textLines.Add(lines[i++]);
+
+                    if (i < lines.Count && string.IsNullOrWhiteSpace(lines[i]))
+                        i++;
+
+                    globIndex++;
+                    sw.WriteLine(globIndex);
+                    sw.WriteLine($"{HelperSRTVTT.FormatSrtTimestamp(startMs)} --> {HelperSRTVTT.FormatSrtTimestamp(endMs)}");
+                    foreach (var t in textLines)
+                        sw.WriteLine(t);
+                    sw.WriteLine();
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"Failed to convert VTT to SRT: {ex.Message}");
+                return false;
+            }
         }
     }
 }

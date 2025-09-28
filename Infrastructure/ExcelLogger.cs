@@ -41,6 +41,7 @@ namespace Infrastructure
             _wsVideo.Cells[_rowV, 4].Value = renamed;
             _rowV++;
         }
+
         public void LogSubtitle(int stt, int key, string original, string renamed)
         {
             _wsSub.Cells[_rowS, 1].Value = stt;
@@ -49,6 +50,15 @@ namespace Infrastructure
             _wsSub.Cells[_rowS, 4].Value = renamed;
             _rowS++;
         }
+        public void LogMissingSubtitle(int stt, int key, string videoName)
+        {
+            _wsSub.Cells[_rowS, 1].Value = stt;
+            _wsSub.Cells[_rowS, 2].Value = key;
+            _wsSub.Cells[_rowS, 3].Value = videoName;
+            _wsSub.Cells[_rowS, 4].Value = "(missing)";
+            _rowS++;
+        }
+
         public void FlushAndSave()
         {
             var videoXlsx = Path.Combine(_logsDir, "rename-video.xlsx");
